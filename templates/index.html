@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SendIT - Transfert Sécurisé</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <style>
+        .screen { display: none !important; opacity: 0; }
+        .screen.active { display: block !important; opacity: 1; }
+    </style>
+</head>
+<body>
+    <div id="toast-container" class="toast-container"></div>
+    
+    <div class="container">
+        <div id="home-screen" class="screen active">
+            <div class="header">
+                <div class="logo">
+                    <span style="font-size: 36px;">🔐</span>
+                    <h1>SendIT</h1>
+                </div>
+                <p class="tagline">Transfert de fichiers sécurisé et anonyme</p>
+            </div>
+
+            <div class="main-buttons">
+                <button class="btn btn-primary" onclick="showSendScreen()">
+                    <span class="btn-icon">📤</span>
+                    <span class="btn-text">Envoyer</span>
+                </button>
+                <button class="btn btn-success" onclick="showReceiveScreen()">
+                    <span class="btn-icon">📥</span>
+                    <span class="btn-text">Recevoir</span>
+                </button>
+            </div>
+
+            <div class="security-info">
+                <h3>🛡️ Sécurité maximale</h3>
+                <ul>
+                    <li>✓ Chiffrement E2E avec XSalsa20-Poly1305 (niveau militaire)</li>
+                    <li>✓ Zéro stockage serveur - transferts éphémères</li>
+                    <li>✓ Clés uniques générées pour chaque session</li>
+                    <li>✓ Authentification intégrée et protection anti-rejeu</li>
+                    <li>✓ Aucune métadonnée stockée ou loggée</li>
+                </ul>
+            </div>
+        </div>
+
+        <div id="send-screen" class="screen">
+            <div class="header">
+                <h2>Envoyer un fichier</h2>
+            </div>
+
+            <div class="file-selection">
+                <input type="file" id="file-input" style="display: none;" onchange="handleFileSelect(event)">
+                <button class="btn btn-primary" onclick="document.getElementById('file-input').click()">
+                    <span class="btn-icon">📁</span>
+                    <span class="btn-text">Sélectionner un fichier</span>
+                </button>
+                <div id="file-info" class="file-info"></div>
+            </div>
+
+            <div id="connection-code-section" class="connection-code-section" style="display: none;">
+                <h3>Votre code de partage</h3>
+                <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 16px;">Partagez ce code avec le destinataire</p>
+                <div class="code-display">
+                    <span id="connection-code" class="code"></span>
+                </div>
+                <button class="btn btn-secondary" onclick="copyCode()">
+                    <span class="btn-icon">📋</span>
+                    <span class="btn-text">Copier le code</span>
+                </button>
+                <p class="hint">Le code sera valide pendant 10 minutes</p>
+                <div id="waiting-status" class="status-message">
+                    <div class="spinner"></div>
+                    <span>En attente d'une connexion...</span>
+                </div>
+            </div>
+
+            <div id="send-progress" style="display: none;">
+                <h3 style="text-align: center; margin-bottom: 24px; color: var(--text-dark);">Transfert en cours</h3>
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div id="send-progress-fill" class="progress-fill"></div>
+                    </div>
+                    <span id="send-progress-text" class="progress-text">0%</span>
+                </div>
+                <p class="status-message">🔐 Données chiffrées en transit...</p>
+            </div>
+
+            <button class="btn btn-back" onclick="showHomeScreen()">Retour</button>
+        </div>
+
+        <div id="receive-screen" class="screen">
+            <div class="header">
+                <h2>Recevoir un fichier</h2>
+            </div>
+
+            <div class="code-input-section">
+                <h3>Entrez le code de partage</h3>
+                <input type="text" id="room-code-input" class="code-input" placeholder="Collez le code reçu">
+                <button class="btn btn-primary" onclick="joinRoom()">
+                    <span class="btn-icon">🔗</span>
+                    <span class="btn-text">Se connecter</span>
+                </button>
+            </div>
+
+            <div id="receive-progress" style="display: none;">
+                <div id="receive-file-info" class="file-info"></div>
+                <h3 style="text-align: center; margin-bottom: 24px; color: var(--text-dark);">Réception en cours</h3>
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div id="receive-progress-fill" class="progress-fill"></div>
+                    </div>
+                    <span id="receive-progress-text" class="progress-text">0%</span>
+                </div>
+                <p class="status-message">📦 Déchiffrement et téléchargement...</p>
+            </div>
+
+            <button class="btn btn-back" onclick="showHomeScreen()">Retour</button>
+        </div>
+
+        <div id="complete-screen" class="screen">
+            <div class="header">
+                <h2>Transfert réussi</h2>
+            </div>
+
+            <div class="success-message">
+                <div class="success-icon">✓</div>
+                <p>Votre fichier a été transféré avec succès en toute sécurité et confidentialité.</p>
+            </div>
+
+            <button class="btn btn-primary" onclick="showHomeScreen()">
+                <span class="btn-icon">🏠</span>
+                <span class="btn-text">Accueil</span>
+            </button>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/tweetnacl.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/socket.io.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
