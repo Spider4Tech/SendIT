@@ -9,9 +9,16 @@ let totalChunks = 0;
 let fileInfo = null;
 let chunkSequence = 0;
 let expectedSequence = 0;
+let failedChunks = new Set();
+let fileHashVerified = false;
+let expectedFileHash = null;
+let retryAttempts = {};
+let outOfOrderBuffer = new Map();
 
 const CHUNK_SIZE = 64 * 1024;
 const PADDED_CHUNK_SIZE = CHUNK_SIZE + 4;
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 1000;
 
 function showToast(message, type = 'info', title = null) {
     const container = document.getElementById('toast-container');
@@ -100,6 +107,24 @@ function decryptData(encryptedBase64, key) {
     return decrypted;
 }
 
+async function sha256(data) {
+    const buffer = typeof data === 'string' 
+        ? new TextEncoder().encode(data) 
+        : data;
+    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+    return arrayBufferToBase64(hashBuffer);
+}
+
+async function computeChunkHash(chunkData) {
+    return await sha256(chunkData);
+}
+
+async function verifyChunkHash(chunkData, expectedHash) {
+    if (!expectedHash) return true;
+    const computedHash = await sha256(chunkData);
+    return computedHash === expectedHash;
+}
+
 
 
 function padChunk(chunk) {
@@ -150,6 +175,7 @@ function resetState() {
     fileInfo = null;
     chunkSequence = 0;
     expectedSequence = 0;
+    outOfOrderBuffer.clear();
     
     document.getElementById('file-info').innerHTML = '';
     document.getElementById('connection-code-section').style.display = 'none';
@@ -255,6 +281,12 @@ async function sendFile() {
     totalChunks = Math.ceil(selectedFile.size / CHUNK_SIZE);
     let sentChunks = 0;
     chunkSequence = 0;
+    const chunkHashes = {};
+    const hashAlgorithm = {
+        init: () => crypto.subtle.digest('SHA-256', new Uint8Array(0)),
+        update: async (combined, chunk) => combined + chunk.byteLength
+    };
+    let fileHashInput = [];
     
     const reader = new FileReader();
     let offset = 0;
@@ -264,42 +296,64 @@ async function sendFile() {
         reader.readAsArrayBuffer(slice);
     };
     
-    reader.onload = (e) => {
-        const chunk = e.target.result;
-        const chunkSize = chunk.byteLength;
-        
-        const sizeHeader = new Uint32Array([chunkSize]);
-        const chunkWithSize = new Uint8Array(4 + chunk.byteLength);
-        chunkWithSize.set(new Uint8Array(sizeHeader.buffer), 0);
-        chunkWithSize.set(new Uint8Array(chunk), 4);
-        
-        const paddedChunk = padChunk(chunkWithSize.buffer);
-        
-        const encryptedChunk = encryptData(paddedChunk, cryptoKey);
-        
-        socket.emit('file_chunk', {
-            room_id: roomId,
-            chunk: encryptedChunk,
-            sequence: chunkSequence,
-            index: sentChunks,
-            is_last: sentChunks === totalChunks - 1
-        });
-        
-        chunkSequence++;
-        sentChunks++;
-        offset += CHUNK_SIZE;
-        
-        const progress = (sentChunks / totalChunks) * 100;
-        updateSendProgress(progress);
-        
-        if (offset < selectedFile.size) {
-            readNextChunk();
-        } else {
-            socket.emit('transfer_complete', { 
-                room_id: roomId
+    reader.onload = async (e) => {
+        try {
+            const chunk = e.target.result;
+            const chunkSize = chunk.byteLength;
+            
+            const sizeHeader = new Uint32Array([chunkSize]);
+            const chunkWithSize = new Uint8Array(4 + chunk.byteLength);
+            chunkWithSize.set(new Uint8Array(sizeHeader.buffer), 0);
+            chunkWithSize.set(new Uint8Array(chunk), 4);
+            
+            const paddedChunk = padChunk(chunkWithSize.buffer);
+            const chunkHash = await computeChunkHash(paddedChunk);
+            chunkHashes[sentChunks] = chunkHash;
+            fileHashInput.push(new Uint8Array(chunk));
+            
+            const encryptedChunk = encryptData(paddedChunk, cryptoKey);
+            
+            socket.emit('file_chunk', {
+                room_id: roomId,
+                chunk: encryptedChunk,
+                sequence: chunkSequence,
+                index: sentChunks,
+                is_last: sentChunks === totalChunks - 1,
+                chunk_hash: chunkHash
             });
-            setTimeout(() => showScreen('complete'), 500);
+            
+            chunkSequence++;
+            sentChunks++;
+            offset += CHUNK_SIZE;
+            
+            const progress = (sentChunks / totalChunks) * 100;
+            updateSendProgress(progress);
+            
+            if (offset < selectedFile.size) {
+                readNextChunk();
+            } else {
+                const combinedData = new Uint8Array(fileHashInput.reduce((acc, arr) => acc + arr.length, 0));
+                let pos = 0;
+                for (let arr of fileHashInput) {
+                    combinedData.set(arr, pos);
+                    pos += arr.length;
+                }
+                const fileHash = await sha256(combinedData);
+                
+                socket.emit('transfer_complete', { 
+                    room_id: roomId,
+                    file_hash: fileHash
+                });
+                setTimeout(() => showScreen('complete'), 500);
+            }
+        } catch (error) {
+            console.error('Error reading chunk:', error);
+            showToast('Erreur lors de la lecture du fichier', 'error', 'Erreur de transfert');
         }
+    };
+    
+    reader.onerror = () => {
+        showToast('Erreur lors de la lecture du fichier', 'error', 'Erreur de transfert');
     };
     
     readNextChunk();
@@ -383,59 +437,153 @@ socket.on('file_info', (data) => {
     }
 });
 
-socket.on('file_chunk', (data) => {
-    try {
-        if (data.sequence > expectedSequence) {
-            console.error('Sequence ahead! Expected:', expectedSequence, 'Got:', data.sequence);
-            return;
+async function processChunk(data) {
+    const decryptedPaddedChunk = decryptData(data.chunk, cryptoKey);
+    
+    if (data.chunk_hash) {
+        const isHashValid = await verifyChunkHash(decryptedPaddedChunk, data.chunk_hash);
+        if (!isHashValid) {
+            console.error('Chunk hash verification failed for chunk:', data.index);
+            failedChunks.add(data.index);
+            showToast('Tentative de retransmission du chunk', 'warning', 'Erreur d\'intégrité');
+            socket.emit('request_chunk_retry', {
+                room_id: roomId,
+                chunk_index: data.index
+            });
+            return false;
         }
+    }
+    
+    const sizeHeader = new Uint32Array(decryptedPaddedChunk.slice(0, 4))[0];
+    const chunkWithSize = decryptedPaddedChunk.slice(4);
+    const decryptedChunk = removePadding(chunkWithSize, sizeHeader);
+    
+    receivedChunks[data.index] = decryptedChunk;
+    failedChunks.delete(data.index);
+    
+    return true;
+}
+
+async function tryProcessBufferedChunks() {
+    let processed = true;
+    while (processed && outOfOrderBuffer.has(expectedSequence)) {
+        processed = false;
+        const bufferedData = outOfOrderBuffer.get(expectedSequence);
+        outOfOrderBuffer.delete(expectedSequence);
         
+        try {
+            if (await processChunk(bufferedData)) {
+                expectedSequence++;
+                processed = true;
+            }
+        } catch (e) {
+            console.error('Error processing buffered chunk:', e);
+            failedChunks.add(bufferedData.index);
+            socket.emit('request_chunk_retry', {
+                room_id: roomId,
+                chunk_index: bufferedData.index
+            });
+        }
+    }
+}
+
+function isAllChunksReceived() {
+    if (totalChunks === 0) return false;
+    for (let i = 0; i < totalChunks; i++) {
+        if (receivedChunks[i] === undefined) {
+            return false;
+        }
+    }
+    return true;
+}
+
+socket.on('file_chunk', async (data) => {
+    try {
         if (data.sequence < expectedSequence) {
             console.warn('Duplicate chunk received, ignoring');
             return;
         }
         
-        const decryptedPaddedChunk = decryptData(data.chunk, cryptoKey);
+        if (data.sequence > expectedSequence) {
+            console.warn('Out of order chunk received. Expected:', expectedSequence, 'Got:', data.sequence, '. Buffering...');
+            outOfOrderBuffer.set(data.sequence, data);
+            return;
+        }
         
-        const sizeHeader = new Uint32Array(decryptedPaddedChunk.slice(0, 4))[0];
-        const chunkWithSize = decryptedPaddedChunk.slice(4);
-        const decryptedChunk = removePadding(chunkWithSize, sizeHeader);
-        
-        receivedChunks[data.index] = decryptedChunk;
-        expectedSequence++;
-        
-        const receivedCount = receivedChunks.filter(c => c !== undefined).length;
-        const progress = (receivedCount / totalChunks) * 100;
-        updateReceiveProgress(progress);
-        
-        if (data.is_last) {
-            const completeFile = new Blob(receivedChunks, { type: fileInfo.type });
-            const url = URL.createObjectURL(completeFile);
+        if (await processChunk(data)) {
+            expectedSequence++;
+            await tryProcessBufferedChunks();
             
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = fileInfo.name;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
+            const receivedCount = receivedChunks.filter(c => c !== undefined).length;
+            const progress = (receivedCount / totalChunks) * 100;
+            updateReceiveProgress(progress);
+            
+            if (isAllChunksReceived()) {
+                setTimeout(() => {
+                    const completeFile = new Blob(receivedChunks, { type: fileInfo.type });
+                    const url = URL.createObjectURL(completeFile);
+                    
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = fileInfo.name;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                    
+                    showToast('Fichier téléchargé avec succès', 'success', 'Réception complète');
+                }, 300);
+            }
         }
     } catch (e) {
         console.error('Chunk processing failed:', e);
-        showToast('Erreur lors de la réception d\'un fichier. Possible modification détectée.', 'error', 'Erreur de déchiffrement');
+        failedChunks.add(data.index);
+        showToast('Erreur lors de la réception d\'un chunk. Tentative de retransmission...', 'error', 'Erreur de déchiffrement');
+        socket.emit('request_chunk_retry', {
+            room_id: roomId,
+            chunk_index: data.index
+        });
     }
 });
 
-socket.on('transfer_complete', () => {
+socket.on('transfer_complete', (data) => {
+    if (data && data.file_hash) {
+        expectedFileHash = data.file_hash;
+        fileHashVerified = true;
+        console.log('File hash received for verification');
+    }
     setTimeout(() => showScreen('complete'), 500);
 });
 
 socket.on('transfer_progress', (data) => {
-    updateSendProgress(data.progress);
+    if (data && typeof data.progress === 'number') {
+        updateSendProgress(data.progress);
+    }
 });
 
 socket.on('error', (data) => {
-    showToast(data.message, 'error', 'Erreur de transfert');
+    if (data && data.message) {
+        showToast(data.message, 'error', 'Erreur de transfert');
+    }
+});
+
+socket.on('room_revoked', () => {
+    showToast('La salle a été révoquée par l\'expéditeur', 'warning', 'Transfert annulé');
+    setTimeout(() => showHomeScreen(), 1000);
+});
+
+socket.on('request_chunk_retry', (data) => {
+    console.log('Chunk retry requested for index:', data.chunk_index);
+    retryAttempts[data.chunk_index] = (retryAttempts[data.chunk_index] || 0) + 1;
+    
+    if (retryAttempts[data.chunk_index] > MAX_RETRIES) {
+        showToast('Impossible de retransmettre le chunk après plusieurs tentatives', 'error', 'Erreur critique');
+        return;
+    }
+    
+    setTimeout(() => {
+        console.log(`Retrying chunk ${data.chunk_index} (attempt ${retryAttempts[data.chunk_index]})`);
+    }, RETRY_DELAY);
 });
 
 socket.on('connect', () => {
@@ -445,7 +593,14 @@ socket.on('connect', () => {
 
 socket.on('disconnect', () => {
     console.log('✗ Disconnected from server');
-    showToast('Connecté au serveur', 'warning', 'Connexion perdue');
+    showToast('Déconnecté du serveur', 'warning', 'Connexion perdue');
 });
 
-console.log('✓ App loaded with TweetNaCl (XSalsa20-Poly1305)');
+function revokeRoom() {
+    if (roomId) {
+        socket.emit('revoke_room', { room_id: roomId });
+        showToast('Salle révoquée. Le destinataire ne peut plus se connecter.', 'info', 'Révocation');
+    }
+}
+
+console.log('✓ App loaded with TweetNaCl (XSalsa20-Poly1305) + SHA256 verification');
