@@ -1,76 +1,70 @@
 const socket = io();
 
-let currentScreen = 'home';
-let selectedFile = null;
-let roomId = null;
-let cryptoKey = null;
-let receivedChunks = [];
-let totalChunks = 0;
-let fileInfo = null;
-let chunkSequence = 0;
-let expectedSequence = 0;
-let failedChunks = new Set();
-let fileHashVerified = false;
-let expectedFileHash = null;
-let retryAttempts = {};
+// --- ÉTAT GLOBAL SÉCURISÉ ---
+let appState = {
+    currentScreen: 'home',
+    selectedFile: null,
+    roomId: null,
+    cryptoKey: null, // Uint8Array
+    receivedChunks: [],
+    totalChunks: 0,
+    fileInfo: null,
+    chunkSequence: 0,
+    expectedSequence: 0,
+    fileHashInput: [], // Pour calcul hash progressif
+    finalFileHash: null // Hash reçu de l'expéditeur
+};
+
+// Buffer pour les chunks arrivés dans le désordre
 let outOfOrderBuffer = new Map();
+let failedChunks = new Set();
+let retryAttempts = {};
 
-const CHUNK_SIZE = 64 * 1024;
-const PADDED_CHUNK_SIZE = CHUNK_SIZE + 4;
+// --- CONSTANTES DE SÉCURITÉ ---
+const CHUNK_SIZE = 64 * 1024; // 64KB
+const PADDED_CHUNK_SIZE = CHUNK_SIZE + 4; // +4 bytes pour la taille
 const MAX_RETRIES = 3;
-const RETRY_DELAY = 1000;
+const BROWSER_MAX_FILE_SIZE = 1024 * 1024 * 1024; // 1GB (Limite hard browser pour éviter crash mémoire)
 
-function showToast(message, type = 'info', title = null) {
-    const container = document.getElementById('toast-container');
-    
-    const toastEl = document.createElement('div');
-    toastEl.className = `toast ${type}`;
-    
-    const icons = {
-        success: '✓',
-        error: '✕',
-        warning: '⚠',
-        info: 'ℹ'
-    };
-    
-    const titles = {
-        success: 'Succès',
-        error: 'Erreur',
-        warning: 'Attention',
-        info: 'Information'
-    };
-    
-    toastEl.innerHTML = `
-        <div class="toast-icon">${icons[type] || icons.info}</div>
-        <div class="toast-content">
-            <div class="toast-title">${title || titles[type]}</div>
-            <div class="toast-message">${message}</div>
-        </div>
-    `;
-    
-    container.appendChild(toastEl);
-    
-    setTimeout(() => {
-        toastEl.classList.add('exit');
-        setTimeout(() => toastEl.remove(), 300);
-    }, 4000);
+// --- UTILITAIRES SÉCURITÉ (CRYPTO & SANITIZATION) ---
+
+/**
+ * Empêche les attaques XSS via les noms de fichiers
+ */
+function escapeHtml(text) {
+    if (!text) return text;
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
 }
 
 function generateEncryptionKey() {
     return nacl.randomBytes(nacl.secretbox.keyLength);
 }
 
+/**
+ * Export clé pour l'URL (Base64URL Safe idéalement, ici Base64 standard pour compatibilité)
+ */
 function exportKey(key) {
-    const keyBuffer = key.buffer || key;
-    return arrayBufferToBase64(keyBuffer);
+    return arrayBufferToBase64(key);
 }
 
 function importKey(keyBase64) {
     const buffer = base64ToArrayBuffer(keyBase64);
+    if (buffer.byteLength !== nacl.secretbox.keyLength) {
+        throw new Error("Longueur de clé invalide");
+    }
     return new Uint8Array(buffer);
 }
 
-function encryptData(data, key) {
+/**
+ * Chiffrement optimisé pour le binaire (Zéro Base64)
+ * Retourne: Uint8Array (Nonce + Ciphertext)
+ */
+function encryptDataBinary(data, key) {
     let dataToEncrypt;
     if (typeof data === 'string') {
         dataToEncrypt = new TextEncoder().encode(data);
@@ -81,167 +75,39 @@ function encryptData(data, key) {
     }
     
     const nonce = nacl.randomBytes(nacl.secretbox.nonceLength);
-    const keyArray = new Uint8Array(key);
-    const encrypted = nacl.secretbox(dataToEncrypt, nonce, keyArray);
+    const encrypted = nacl.secretbox(dataToEncrypt, nonce, key);
     
+    // Concaténation performante
     const combined = new Uint8Array(nonce.length + encrypted.length);
     combined.set(nonce, 0);
     combined.set(encrypted, nonce.length);
     
-    return arrayBufferToBase64(combined.buffer);
+    return combined; // Retourne du binaire pur
 }
 
-function decryptData(encryptedBase64, key) {
-    const combined = new Uint8Array(base64ToArrayBuffer(encryptedBase64));
-    const nonceLength = nacl.secretbox.nonceLength;
-    const nonce = combined.slice(0, nonceLength);
-    const encrypted = combined.slice(nonceLength);
+/**
+ * Déchiffrement optimisé pour le binaire
+ */
+function decryptDataBinary(data, key) {
+    // data peut être ArrayBuffer ou Uint8Array venant de Socket.io
+    const combined = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
     
-    const keyArray = new Uint8Array(key);
-    const decrypted = nacl.secretbox.open(encrypted, nonce, keyArray);
+    const nonceLength = nacl.secretbox.nonceLength;
+    if (combined.length < nonceLength) throw new Error("Données trop courtes");
+
+    const nonce = combined.slice(0, nonceLength);
+    const ciphertext = combined.slice(nonceLength);
+    
+    const decrypted = nacl.secretbox.open(ciphertext, nonce, key);
     
     if (!decrypted) {
-        throw new Error('Decryption failed - data may be corrupted or modified');
+        throw new Error('Échec déchiffrement - Intégrité compromise');
     }
     
     return decrypted;
 }
 
-async function sha256(data) {
-    const buffer = typeof data === 'string' 
-        ? new TextEncoder().encode(data) 
-        : data;
-    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
-    return arrayBufferToBase64(hashBuffer);
-}
-
-async function computeChunkHash(chunkData) {
-    return await sha256(chunkData);
-}
-
-async function verifyChunkHash(chunkData, expectedHash) {
-    if (!expectedHash) return true;
-    const computedHash = await sha256(chunkData);
-    return computedHash === expectedHash;
-}
-
-
-
-function padChunk(chunk) {
-    if (chunk.byteLength >= PADDED_CHUNK_SIZE) {
-        return chunk;
-    }
-    
-    const padded = new Uint8Array(PADDED_CHUNK_SIZE);
-    padded.set(new Uint8Array(chunk), 0);
-    
-    const padding = crypto.getRandomValues(new Uint8Array(PADDED_CHUNK_SIZE - chunk.byteLength));
-    padded.set(padding, chunk.byteLength);
-    
-    return padded.buffer;
-}
-
-function removePadding(paddedChunk, originalSize) {
-    return paddedChunk.slice(0, originalSize);
-}
-
-function showScreen(screenId) {
-    document.querySelectorAll('.screen').forEach(screen => {
-        screen.classList.remove('active');
-    });
-    document.getElementById(screenId + '-screen').classList.add('active');
-    currentScreen = screenId;
-}
-
-function showHomeScreen() {
-    resetState();
-    showScreen('home');
-}
-
-function showSendScreen() {
-    showScreen('send');
-}
-
-function showReceiveScreen() {
-    showScreen('receive');
-}
-
-function resetState() {
-    selectedFile = null;
-    roomId = null;
-    cryptoKey = null;
-    receivedChunks = [];
-    totalChunks = 0;
-    fileInfo = null;
-    chunkSequence = 0;
-    expectedSequence = 0;
-    outOfOrderBuffer.clear();
-    
-    document.getElementById('file-info').innerHTML = '';
-    document.getElementById('connection-code-section').style.display = 'none';
-    document.getElementById('send-progress').style.display = 'none';
-    document.getElementById('receive-progress').style.display = 'none';
-    document.getElementById('room-code-input').value = '';
-}
-
-function handleFileSelect(event) {
-    try {
-        selectedFile = event.target.files[0];
-        if (selectedFile) {
-            const fileInfoDiv = document.getElementById('file-info');
-            const sizeInMB = (selectedFile.size / (1024 * 1024)).toFixed(2);
-            fileInfoDiv.innerHTML = `
-                <strong>${selectedFile.name}</strong><br>
-                Taille: ${sizeInMB} MB<br>
-                Type: ${selectedFile.type || 'inconnu'}
-            `;
-            
-            console.log('Generating encryption key...');
-            cryptoKey = generateEncryptionKey();
-            console.log('Key generated, creating room...');
-            
-            socket.emit('create_room', {});
-        }
-    } catch (error) {
-        console.error('Error in handleFileSelect:', error);
-        showToast(error.message, 'error', 'Erreur de sélection');
-    }
-}
-
-function copyCode() {
-    const code = document.getElementById('connection-code').textContent;
-    navigator.clipboard.writeText(code).then(() => {
-        showToast('Code copié dans le presse-papier', 'success', 'Copié');
-    }).catch(() => {
-        showToast('Impossible de copier le code', 'error', 'Erreur');
-    });
-}
-
-function joinRoom() {
-    const code = document.getElementById('room-code-input').value.trim();
-    if (!code) {
-        showToast('Veuillez entrer un code de connexion', 'warning');
-        return;
-    }
-    
-    const parts = code.split('::');
-    if (parts.length !== 2) {
-        showToast('Code de connexion invalide', 'error');
-        return;
-    }
-    
-    roomId = parts[0];
-    const keyBase64 = parts[1];
-    
-    try {
-        cryptoKey = importKey(keyBase64);
-        socket.emit('join_room', { room_id: roomId });
-    } catch (e) {
-        showToast('Code de connexion invalide', 'error');
-        console.error('Key import error:', e);
-    }
-}
-
+// Helpers Base64 (Uniquement pour l'échange de clé initial et JSON)
 function arrayBufferToBase64(buffer) {
     const bytes = new Uint8Array(buffer);
     let binary = '';
@@ -260,347 +126,481 @@ function base64ToArrayBuffer(base64) {
     return bytes.buffer;
 }
 
+// Hashing
+async function sha256(data) {
+    const buffer = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+    const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+    return arrayBufferToBase64(hashBuffer);
+}
+
+async function computeChunkHash(chunkData) {
+    return await sha256(chunkData);
+}
+
+// Padding (Obfuscation taille exacte)
+function padChunk(chunk) {
+    if (chunk.byteLength >= PADDED_CHUNK_SIZE) return chunk;
+    
+    const padded = new Uint8Array(PADDED_CHUNK_SIZE);
+    padded.set(new Uint8Array(chunk), 0);
+    // Remplissage avec données aléatoires (pas de zéros) pour sécurité crypto
+    const padding = nacl.randomBytes(PADDED_CHUNK_SIZE - chunk.byteLength);
+    padded.set(padding, chunk.byteLength);
+    return padded.buffer;
+}
+
+function removePadding(paddedChunk, originalSize) {
+    return paddedChunk.slice(0, originalSize);
+}
+
+// --- UI / UX APPLE STYLE ---
+
+function showToast(message, type = 'info') {
+    const container = document.getElementById('toast-container');
+    if (!container) return;
+
+    const toastEl = document.createElement('div');
+    toastEl.className = `toast ${type}`;
+    
+    const icons = { success: '✓', error: '✕', warning: '!', info: 'ℹ' };
+
+    // Utilisation de textContent pour éviter XSS dans le message
+    toastEl.innerHTML = `
+        <span class="toast-icon">${icons[type] || icons.info}</span>
+        <div class="toast-content">
+            <div class="toast-title"></div>
+        </div>
+    `;
+    toastEl.querySelector('.toast-title').textContent = message; // Insertion sécurisée
+    
+    container.appendChild(toastEl);
+    
+    setTimeout(() => {
+        toastEl.classList.add('exit');
+        setTimeout(() => toastEl.remove(), 300);
+    }, 4000);
+}
+
+function showScreen(screenId) {
+    document.querySelectorAll('.screen').forEach(screen => {
+        screen.classList.remove('active');
+        setTimeout(() => {
+            if(!screen.classList.contains('active')) screen.style.display = 'none';
+        }, 300); 
+    });
+
+    const targetScreen = document.getElementById(screenId + '-screen');
+    targetScreen.style.display = 'block';
+    void targetScreen.offsetWidth; // Force Reflow
+    targetScreen.classList.add('active');
+    appState.currentScreen = screenId;
+}
+
+function showHomeScreen() { resetState(); showScreen('home'); }
+function showSendScreen() { showScreen('send'); }
+function showReceiveScreen() { showScreen('receive'); }
+
+function resetState() {
+    // Nettoyage profond
+    appState = {
+        currentScreen: 'home',
+        selectedFile: null,
+        roomId: null,
+        cryptoKey: null,
+        receivedChunks: [],
+        totalChunks: 0,
+        fileInfo: null,
+        chunkSequence: 0,
+        expectedSequence: 0,
+        fileHashInput: [],
+        finalFileHash: null
+    };
+    outOfOrderBuffer.clear();
+    failedChunks.clear();
+    retryAttempts = {};
+    
+    // UI Reset
+    document.getElementById('file-info').innerHTML = '';
+    document.getElementById('connection-code-section').style.display = 'none';
+    document.getElementById('send-progress').style.display = 'none';
+    document.getElementById('receive-progress').style.display = 'none';
+    const codeInput = document.getElementById('room-code-input');
+    if(codeInput) codeInput.value = '';
+    document.getElementById('receive-file-info').innerHTML = '';
+}
+
+function handleFileSelect(event) {
+    try {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        if (file.size > BROWSER_MAX_FILE_SIZE) {
+            showToast(`Fichier trop volumineux (>1GB). Limite navigateur.`, 'error');
+            event.target.value = ''; // Reset input
+            return;
+        }
+
+        appState.selectedFile = file;
+        const sizeInMB = (file.size / (1024 * 1024)).toFixed(2);
+        
+        // Affichage sécurisé (escapeHtml)
+        document.getElementById('file-info').innerHTML = `
+            <div style="font-weight: 600; font-size: 15px; margin-bottom: 4px;">${escapeHtml(file.name)}</div>
+            <div style="color: var(--text-secondary); font-size: 13px;">${sizeInMB} MB • ${escapeHtml(file.type) || 'Fichier'}</div>
+        `;
+        
+        console.log('Génération clé de chiffrement...');
+        appState.cryptoKey = generateEncryptionKey();
+        socket.emit('create_room', {});
+
+    } catch (error) {
+        console.error('Error:', error);
+        showToast('Erreur de sélection', 'error');
+    }
+}
+
+function copyCode() {
+    const code = document.getElementById('connection-code').textContent;
+    navigator.clipboard.writeText(code)
+        .then(() => showToast('Code copié', 'success'))
+        .catch(() => showToast('Erreur de copie', 'error'));
+}
+
+// --- LOGIQUE TRANSFERT ---
+
+function joinRoom() {
+    const codeInput = document.getElementById('room-code-input');
+    const code = codeInput.value.trim();
+    
+    if (!code) {
+        showToast('Veuillez entrer un code', 'warning');
+        return;
+    }
+    
+    const parts = code.split('::');
+    if (parts.length !== 2) {
+        showToast('Format de code invalide', 'error');
+        return;
+    }
+    
+    appState.roomId = parts[0];
+    try {
+        appState.cryptoKey = importKey(parts[1]);
+        socket.emit('join_room', { room_id: appState.roomId });
+    } catch (e) {
+        showToast('Clé de chiffrement invalide', 'error');
+    }
+}
+
 async function sendFile() {
-    if (!selectedFile || !roomId || !cryptoKey) return;
+    if (!appState.selectedFile || !appState.roomId || !appState.cryptoKey) return;
     
     document.getElementById('waiting-status').style.display = 'none';
     document.getElementById('send-progress').style.display = 'block';
     
-    const encryptedMetadata = encryptData(JSON.stringify({
-        name: selectedFile.name,
-        size: selectedFile.size,
-        type: selectedFile.type,
+    // Métadonnées chiffrées (JSON -> String -> Binary -> Encrypt)
+    const metadata = JSON.stringify({
+        name: appState.selectedFile.name,
+        size: appState.selectedFile.size,
+        type: appState.selectedFile.type,
         timestamp: Date.now()
-    }), cryptoKey);
+    });
+    
+    // On utilise base64 pour les métadonnées car c'est du JSON transporté
+    const encryptedMetadata = arrayBufferToBase64(encryptDataBinary(metadata, appState.cryptoKey));
     
     socket.emit('file_info', {
-        room_id: roomId,
+        room_id: appState.roomId,
         encrypted_metadata: encryptedMetadata
     });
     
-    totalChunks = Math.ceil(selectedFile.size / CHUNK_SIZE);
+    appState.totalChunks = Math.ceil(appState.selectedFile.size / CHUNK_SIZE);
     let sentChunks = 0;
-    chunkSequence = 0;
-    const chunkHashes = {};
-    const hashAlgorithm = {
-        init: () => crypto.subtle.digest('SHA-256', new Uint8Array(0)),
-        update: async (combined, chunk) => combined + chunk.byteLength
-    };
-    let fileHashInput = [];
+    appState.chunkSequence = 0;
+    let fileHashAccumulator = [];
     
     const reader = new FileReader();
     let offset = 0;
     
     const readNextChunk = () => {
-        const slice = selectedFile.slice(offset, offset + CHUNK_SIZE);
+        const slice = appState.selectedFile.slice(offset, offset + CHUNK_SIZE);
         reader.readAsArrayBuffer(slice);
     };
     
     reader.onload = async (e) => {
         try {
-            const chunk = e.target.result;
+            const chunk = e.target.result; // ArrayBuffer
             const chunkSize = chunk.byteLength;
             
+            // Préparation données (Taille + Data)
             const sizeHeader = new Uint32Array([chunkSize]);
             const chunkWithSize = new Uint8Array(4 + chunk.byteLength);
             chunkWithSize.set(new Uint8Array(sizeHeader.buffer), 0);
             chunkWithSize.set(new Uint8Array(chunk), 4);
             
+            // Padding & Hashing
             const paddedChunk = padChunk(chunkWithSize.buffer);
             const chunkHash = await computeChunkHash(paddedChunk);
-            chunkHashes[sentChunks] = chunkHash;
-            fileHashInput.push(new Uint8Array(chunk));
             
-            const encryptedChunk = encryptData(paddedChunk, cryptoKey);
+            // Pour le hash final global
+            fileHashAccumulator.push(new Uint8Array(chunk));
+            
+            // Chiffrement BINAIRE pur (pas de base64 ici !)
+            const encryptedChunk = encryptDataBinary(paddedChunk, appState.cryptoKey);
             
             socket.emit('file_chunk', {
-                room_id: roomId,
-                chunk: encryptedChunk,
-                sequence: chunkSequence,
+                room_id: appState.roomId,
+                chunk: encryptedChunk, // Envoi buffer direct
+                sequence: appState.chunkSequence,
                 index: sentChunks,
-                is_last: sentChunks === totalChunks - 1,
+                is_last: sentChunks === appState.totalChunks - 1,
                 chunk_hash: chunkHash
             });
             
-            chunkSequence++;
+            appState.chunkSequence++;
             sentChunks++;
             offset += CHUNK_SIZE;
             
-            const progress = (sentChunks / totalChunks) * 100;
-            updateSendProgress(progress);
+            updateSendProgress((sentChunks / appState.totalChunks) * 100);
             
-            if (offset < selectedFile.size) {
+            if (offset < appState.selectedFile.size) {
+                // Petit délai pour laisser respirer l'Event Loop
+                if (sentChunks % 50 === 0) await new Promise(r => setTimeout(r, 0));
                 readNextChunk();
             } else {
-                const combinedData = new Uint8Array(fileHashInput.reduce((acc, arr) => acc + arr.length, 0));
+                // Calcul Hash Final
+                const combinedData = new Uint8Array(fileHashAccumulator.reduce((acc, arr) => acc + arr.length, 0));
                 let pos = 0;
-                for (let arr of fileHashInput) {
+                for (let arr of fileHashAccumulator) {
                     combinedData.set(arr, pos);
                     pos += arr.length;
                 }
                 const fileHash = await sha256(combinedData);
                 
                 socket.emit('transfer_complete', { 
-                    room_id: roomId,
-                    file_hash: fileHash
+                    room_id: appState.roomId, 
+                    file_hash: fileHash 
                 });
+                
                 setTimeout(() => showScreen('complete'), 500);
             }
         } catch (error) {
-            console.error('Error reading chunk:', error);
-            showToast('Erreur lors de la lecture du fichier', 'error', 'Erreur de transfert');
+            console.error('Chunk Error:', error);
+            showToast('Erreur lecture fichier', 'error');
         }
     };
     
-    reader.onerror = () => {
-        showToast('Erreur lors de la lecture du fichier', 'error', 'Erreur de transfert');
-    };
-    
+    reader.onerror = () => showToast('Erreur lecture fichier', 'error');
     readNextChunk();
 }
 
 function updateSendProgress(progress) {
-    const progressFill = document.getElementById('send-progress-fill');
-    const progressText = document.getElementById('send-progress-text');
-    progressFill.style.width = progress + '%';
-    progressText.textContent = Math.round(progress) + '%';
+    document.getElementById('send-progress-fill').style.width = progress + '%';
+    document.getElementById('send-progress-text').textContent = Math.round(progress) + '%';
 }
 
 function updateReceiveProgress(progress) {
-    const progressFill = document.getElementById('receive-progress-fill');
-    const progressText = document.getElementById('receive-progress-text');
-    progressFill.style.width = progress + '%';
-    progressText.textContent = Math.round(progress) + '%';
+    document.getElementById('receive-progress-fill').style.width = progress + '%';
+    document.getElementById('receive-progress-text').textContent = Math.round(progress) + '%';
     
-    socket.emit('transfer_progress', {
-        room_id: roomId,
-        progress: progress
-    });
+    // Feedback optionnel
+    if (progress % 5 < 1) socket.emit('transfer_progress', { room_id: appState.roomId, progress: progress });
 }
 
+// --- SOCKET EVENTS ---
+
+// Dans app.js
+
 socket.on('room_created', (data) => {
+    // 🚩 VÉRIFICATION CRITIQUE 🚩
+    console.log('--- ROOM CREATED EVENT RECEIVED ---', data); 
+    // Si ce log n'apparaît pas, l'événement est perdu entre le serveur et le client.
+    
     try {
-        console.log('Room created:', data);
-        roomId = data.room_id;
-        const keyBase64 = exportKey(cryptoKey);
+        appState.roomId = data.room_id;
+        const keyBase64 = exportKey(appState.cryptoKey); 
+        const fullCode = `${appState.roomId}::${keyBase64}`;
         
-        const fullCode = `${roomId}::${keyBase64}`;
-        console.log('Generated code:', fullCode);
         document.getElementById('connection-code').textContent = fullCode;
         document.getElementById('connection-code-section').style.display = 'block';
-        showToast('Salle créée. Partagez le code avec votre destinataire', 'success', 'Prêt');
-    } catch (error) {
-        console.error('Error in room_created:', error);
-        showToast(error.message, 'error', 'Erreur de création');
+        showToast('Salle prête. Code généré.', 'success');
+        
+    } catch (e) {
+        // --- CATCH LES ERREURS DANS CE BLOC UNIQUEMENT ---
+        console.error("Erreur critique d'affichage du code/clé:", e);
+        showToast("Erreur d'initialisation de session.", 'error');
     }
 });
 
-socket.on('room_joined', (data) => {
+socket.on('room_joined', () => {
     document.getElementById('receive-progress').style.display = 'block';
-    showToast('Connecté au partage. Préparation de la réception...', 'info', 'Connecté');
+    showToast('Connexion établie. Attente...', 'info');
 });
 
 socket.on('peer_connected', () => {
     sendFile();
+    showToast('Destinataire prêt. Envoi...', 'info');
 });
 
 socket.on('file_info', (data) => {
     try {
-        console.log('Received file_info, encrypted_metadata length:', data.encrypted_metadata.length);
-        console.log('Crypto key:', typeof cryptoKey, 'length:', cryptoKey.byteLength || cryptoKey.length);
-        if (cryptoKey.byteLength !== 32 && cryptoKey.length !== 32) {
-            console.error('KEY SIZE MISMATCH! Expected 32, got:', cryptoKey.byteLength || cryptoKey.length);
-        }
+        // 1. Déchiffrement
+        const decryptedBytes = decryptDataBinary(base64ToArrayBuffer(data.encrypted_metadata), appState.cryptoKey);
+        const metadataStr = new TextDecoder().decode(decryptedBytes);
+        appState.fileInfo = JSON.parse(metadataStr);
         
-        const decryptedMetadata = decryptData(data.encrypted_metadata, cryptoKey);
-        console.log('Decrypted metadata type:', decryptedMetadata.constructor.name, 'length:', decryptedMetadata.length);
-        
-        const metadataStr = new TextDecoder().decode(decryptedMetadata);
-        console.log('Metadata string first 50 chars:', metadataStr.substring(0, 50));
-        
-        fileInfo = JSON.parse(metadataStr);
-        
-        const sizeInMB = (fileInfo.size / (1024 * 1024)).toFixed(2);
+        // 2. Affichage sécurisé
+        const sizeInMB = (appState.fileInfo.size / (1024 * 1024)).toFixed(2);
         document.getElementById('receive-file-info').innerHTML = `
-            <strong>${fileInfo.name}</strong><br>
-            Taille: ${sizeInMB} MB
+            <div style="font-weight:600; margin-bottom:4px;">${escapeHtml(appState.fileInfo.name)}</div>
+            <div style="color:var(--text-secondary); font-size:13px;">${sizeInMB} MB</div>
         `;
         
-        totalChunks = Math.ceil(fileInfo.size / CHUNK_SIZE);
-        receivedChunks = new Array(totalChunks);
-        expectedSequence = 0;
-        console.log('File info processed successfully');
+        // 3. Préparation
+        appState.totalChunks = Math.ceil(appState.fileInfo.size / CHUNK_SIZE);
+        appState.receivedChunks = new Array(appState.totalChunks);
+        appState.expectedSequence = 0;
+        
     } catch (e) {
-        console.error('Metadata decryption failed:', e);
-        console.error('Stack:', e.stack);
-        showToast('Impossible de déchiffrer les métadonnées du fichier', 'error', 'Erreur de déchiffrement');
+        console.error('Metadata Error:', e);
+        showToast('Erreur intégrité métadonnées', 'error');
+        socket.emit('revoke_room', { room_id: appState.roomId });
     }
 });
 
 async function processChunk(data) {
-    const decryptedPaddedChunk = decryptData(data.chunk, cryptoKey);
+    // data.chunk est un ArrayBuffer/Uint8Array brut ici (pas de base64)
+    const decryptedPaddedChunk = decryptDataBinary(data.chunk, appState.cryptoKey);
     
+    // Vérification Hash du Chunk (Intégrité niveau paquet)
     if (data.chunk_hash) {
-        const isHashValid = await verifyChunkHash(decryptedPaddedChunk, data.chunk_hash);
-        if (!isHashValid) {
-            console.error('Chunk hash verification failed for chunk:', data.index);
+        const computedHash = await computeChunkHash(decryptedPaddedChunk);
+        if (computedHash !== data.chunk_hash) {
             failedChunks.add(data.index);
-            showToast('Tentative de retransmission du chunk', 'warning', 'Erreur d\'intégrité');
-            socket.emit('request_chunk_retry', {
-                room_id: roomId,
-                chunk_index: data.index
-            });
+            showToast('Chunk corrompu détecté', 'warning');
+            socket.emit('request_chunk_retry', { room_id: appState.roomId, chunk_index: data.index });
             return false;
         }
     }
     
-    const sizeHeader = new Uint32Array(decryptedPaddedChunk.slice(0, 4))[0];
+    // Extraction taille réelle
+    const sizeHeader = new Uint32Array(decryptedPaddedChunk.slice(0, 4).buffer)[0];
     const chunkWithSize = decryptedPaddedChunk.slice(4);
     const decryptedChunk = removePadding(chunkWithSize, sizeHeader);
     
-    receivedChunks[data.index] = decryptedChunk;
+    appState.receivedChunks[data.index] = decryptedChunk;
     failedChunks.delete(data.index);
-    
     return true;
 }
 
 async function tryProcessBufferedChunks() {
     let processed = true;
-    while (processed && outOfOrderBuffer.has(expectedSequence)) {
+    while (processed && outOfOrderBuffer.has(appState.expectedSequence)) {
         processed = false;
-        const bufferedData = outOfOrderBuffer.get(expectedSequence);
-        outOfOrderBuffer.delete(expectedSequence);
+        const bufferedData = outOfOrderBuffer.get(appState.expectedSequence);
+        outOfOrderBuffer.delete(appState.expectedSequence);
         
         try {
             if (await processChunk(bufferedData)) {
-                expectedSequence++;
+                appState.expectedSequence++;
                 processed = true;
             }
         } catch (e) {
-            console.error('Error processing buffered chunk:', e);
             failedChunks.add(bufferedData.index);
-            socket.emit('request_chunk_retry', {
-                room_id: roomId,
-                chunk_index: bufferedData.index
-            });
+            socket.emit('request_chunk_retry', { room_id: appState.roomId, chunk_index: bufferedData.index });
         }
     }
 }
 
 function isAllChunksReceived() {
-    if (totalChunks === 0) return false;
-    for (let i = 0; i < totalChunks; i++) {
-        if (receivedChunks[i] === undefined) {
-            return false;
-        }
+    if (appState.totalChunks === 0) return false;
+    let count = 0;
+    for (let i = 0; i < appState.totalChunks; i++) {
+        if (appState.receivedChunks[i] !== undefined) count++;
     }
-    return true;
+    return count === appState.totalChunks;
 }
 
 socket.on('file_chunk', async (data) => {
     try {
-        if (data.sequence < expectedSequence) {
-            console.warn('Duplicate chunk received, ignoring');
-            return;
-        }
+        if (data.sequence < appState.expectedSequence) return;
         
-        if (data.sequence > expectedSequence) {
-            console.warn('Out of order chunk received. Expected:', expectedSequence, 'Got:', data.sequence, '. Buffering...');
+        if (data.sequence > appState.expectedSequence) {
             outOfOrderBuffer.set(data.sequence, data);
             return;
         }
         
         if (await processChunk(data)) {
-            expectedSequence++;
+            appState.expectedSequence++;
             await tryProcessBufferedChunks();
             
-            const receivedCount = receivedChunks.filter(c => c !== undefined).length;
-            const progress = (receivedCount / totalChunks) * 100;
-            updateReceiveProgress(progress);
+            // Calcul progression exact
+            let receivedCount = 0;
+            for(let i=0; i<appState.receivedChunks.length; i++) {
+                if(appState.receivedChunks[i]) receivedCount++;
+            }
             
-            if (isAllChunksReceived()) {
-                setTimeout(() => {
-                    const completeFile = new Blob(receivedChunks, { type: fileInfo.type });
-                    const url = URL.createObjectURL(completeFile);
-                    
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = fileInfo.name;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    URL.revokeObjectURL(url);
-                    
-                    showToast('Fichier téléchargé avec succès', 'success', 'Réception complète');
-                }, 300);
+            updateReceiveProgress((receivedCount / appState.totalChunks) * 100);
+            
+            // Fin du transfert ?
+            if (isAllChunksReceived() && appState.finalFileHash) {
+                finalizeDownload();
             }
         }
     } catch (e) {
-        console.error('Chunk processing failed:', e);
-        failedChunks.add(data.index);
-        showToast('Erreur lors de la réception d\'un chunk. Tentative de retransmission...', 'error', 'Erreur de déchiffrement');
-        socket.emit('request_chunk_retry', {
-            room_id: roomId,
-            chunk_index: data.index
-        });
+        console.error('Chunk Process Fail:', e);
+        socket.emit('request_chunk_retry', { room_id: appState.roomId, chunk_index: data.index });
     }
 });
 
 socket.on('transfer_complete', (data) => {
     if (data && data.file_hash) {
-        expectedFileHash = data.file_hash;
-        fileHashVerified = true;
-        console.log('File hash received for verification');
-    }
-    setTimeout(() => showScreen('complete'), 500);
-});
-
-socket.on('transfer_progress', (data) => {
-    if (data && typeof data.progress === 'number') {
-        updateSendProgress(data.progress);
+        appState.finalFileHash = data.file_hash;
+        // Si on a déjà tous les chunks, on lance la finalisation
+        if (isAllChunksReceived()) finalizeDownload();
     }
 });
 
-socket.on('error', (data) => {
-    if (data && data.message) {
-        showToast(data.message, 'error', 'Erreur de transfert');
-    }
-});
-
-socket.on('room_revoked', () => {
-    showToast('La salle a été révoquée par l\'expéditeur', 'warning', 'Transfert annulé');
-    setTimeout(() => showHomeScreen(), 1000);
-});
-
-socket.on('request_chunk_retry', (data) => {
-    console.log('Chunk retry requested for index:', data.chunk_index);
-    retryAttempts[data.chunk_index] = (retryAttempts[data.chunk_index] || 0) + 1;
+async function finalizeDownload() {
+    // 1. Reconstruction Blob
+    const completeBlob = new Blob(appState.receivedChunks, { type: appState.fileInfo.type });
     
-    if (retryAttempts[data.chunk_index] > MAX_RETRIES) {
-        showToast('Impossible de retransmettre le chunk après plusieurs tentatives', 'error', 'Erreur critique');
+    // 2. Vérification Hash FINAL (Intégrité Fichier Complet)
+    // C'est l'étape critique "Intransigeante"
+    const buffer = await completeBlob.arrayBuffer();
+    const computedFinalHash = await sha256(buffer);
+    
+    if (computedFinalHash !== appState.finalFileHash) {
+        showToast('ERREUR FATALE: Hash fichier invalide ! Destruction.', 'error');
+        resetState(); // On détruit tout, pas de téléchargement
         return;
     }
     
-    setTimeout(() => {
-        console.log(`Retrying chunk ${data.chunk_index} (attempt ${retryAttempts[data.chunk_index]})`);
-    }, RETRY_DELAY);
-});
-
-socket.on('connect', () => {
-    console.log('✓ Connected to server');
-    showToast('Connecté au serveur de transfert', 'success', 'Connexion établie');
-});
-
-socket.on('disconnect', () => {
-    console.log('✗ Disconnected from server');
-    showToast('Déconnecté du serveur', 'warning', 'Connexion perdue');
-});
-
-function revokeRoom() {
-    if (roomId) {
-        socket.emit('revoke_room', { room_id: roomId });
-        showToast('Salle révoquée. Le destinataire ne peut plus se connecter.', 'info', 'Révocation');
-    }
+    // 3. Téléchargement si valide
+    const url = URL.createObjectURL(completeBlob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = appState.fileInfo.name; // Nom déjà sanitize par le navigateur au download
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    showToast('Vérifié & Déchiffré avec succès', 'success');
+    setTimeout(() => showScreen('complete'), 1000);
 }
 
-console.log('✓ App loaded with TweetNaCl (XSalsa20-Poly1305) + SHA256 verification');
+socket.on('transfer_progress', (data) => {
+    if (data?.progress) updateSendProgress(data.progress);
+});
+
+socket.on('error', (data) => showToast(data.message || 'Erreur', 'error'));
+
+socket.on('room_revoked', () => {
+    showToast('Session terminée', 'warning');
+    setTimeout(showHomeScreen, 1500);
+});
+
+socket.on('disconnect', () => showToast('Connexion perdue', 'warning'));
+
+console.log('SendIT Secure Client v2.0 Loaded');

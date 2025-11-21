@@ -2,25 +2,27 @@
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SendIT - Transfert Sécurisé</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>SendIT - Transfert</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
     <style>
-        .screen { display: none !important; opacity: 0; }
-        .screen.active { display: block !important; opacity: 1; }
+        /* Empêche le flash de contenu non stylé (FOUC) */
+        .screen { display: none; opacity: 0; }
+        .screen.active { display: block; opacity: 1; }
     </style>
 </head>
 <body>
     <div id="toast-container" class="toast-container"></div>
     
     <div class="container">
+        
         <div id="home-screen" class="screen active">
             <div class="header">
                 <div class="logo">
-                    <span style="font-size: 36px;">🔐</span>
+                    <span>🔐</span>
                     <h1>SendIT</h1>
                 </div>
-                <p class="tagline">Transfert de fichiers sécurisé et anonyme</p>
+                <p class="tagline">Partagez vos fichiers. Simplement. Sécurisé.</p>
             </div>
 
             <div class="main-buttons">
@@ -35,57 +37,61 @@
             </div>
 
             <div class="security-info">
-                <h3>🛡️ Sécurité maximale</h3>
+                <h3>🛡️ Confidentialité garantie</h3>
                 <ul>
-                    <li>✓ Chiffrement E2E avec XSalsa20-Poly1305 (niveau militaire)</li>
-                    <li>✓ Zéro stockage serveur - transferts éphémères</li>
-                    <li>✓ Clés uniques générées pour chaque session</li>
-                    <li>✓ Authentification intégrée et protection anti-rejeu</li>
-                    <li>✓ Aucune métadonnée stockée ou loggée</li>
+                    <li>Chiffrement de bout en bout (XSalsa20)</li>
+                    <li>Aucun stockage sur nos serveurs</li>
+                    <li>Clés éphémères uniques</li>
+                    <li>Aucun traçage, aucune métadonnée</li>
                 </ul>
             </div>
         </div>
 
         <div id="send-screen" class="screen">
             <div class="header">
-                <h2>Envoyer un fichier</h2>
+                <h2>Envoyer</h2>
             </div>
 
             <div class="file-selection">
                 <input type="file" id="file-input" style="display: none;" onchange="handleFileSelect(event)">
-                <button class="btn btn-primary" onclick="document.getElementById('file-input').click()">
+                
+                <button class="btn btn-primary" onclick="document.getElementById('file-input').click()" style="width: 100%;">
                     <span class="btn-icon">📁</span>
-                    <span class="btn-text">Sélectionner un fichier</span>
+                    <span class="btn-text">Choisir un fichier</span>
                 </button>
-                <div id="file-info" class="file-info"></div>
+                
+                <div id="file-info" class="file-info" style="margin-top: 16px;"></div>
             </div>
 
             <div id="connection-code-section" class="connection-code-section" style="display: none;">
-                <h3>Votre code de partage</h3>
-                <p style="color: var(--text-muted); font-size: 14px; margin-bottom: 16px;">Partagez ce code avec le destinataire</p>
+                <h3>Code de partage</h3>
+                
                 <div class="code-display">
-                    <span id="connection-code" class="code"></span>
+                    <span id="connection-code" class="code">GÉNÉRATION...</span>
                 </div>
+                
                 <button class="btn btn-secondary" onclick="copyCode()">
                     <span class="btn-icon">📋</span>
-                    <span class="btn-text">Copier le code</span>
+                    <span class="btn-text">Copier</span>
                 </button>
-                <p class="hint">Le code sera valide pendant 10 minutes</p>
-                <div id="waiting-status" class="status-message">
+                
+                <p class="hint">Ce code expire dans 10 minutes.</p>
+                
+                <div id="waiting-status" class="status-message" style="margin-top: 24px;">
                     <div class="spinner"></div>
-                    <span>En attente d'une connexion...</span>
+                    <span>En attente du destinataire...</span>
                 </div>
             </div>
 
             <div id="send-progress" style="display: none;">
-                <h3 style="text-align: center; margin-bottom: 24px; color: var(--text-dark);">Transfert en cours</h3>
+                <h3 style="text-align: center; margin-bottom: 16px; font-size: 18px;">Envoi en cours...</h3>
                 <div class="progress-container">
                     <div class="progress-bar">
                         <div id="send-progress-fill" class="progress-fill"></div>
                     </div>
                     <span id="send-progress-text" class="progress-text">0%</span>
                 </div>
-                <p class="status-message">🔐 Données chiffrées en transit...</p>
+                <p class="status-message"><small>Ne fermez pas cette fenêtre.</small></p>
             </div>
 
             <button class="btn btn-back" onclick="showHomeScreen()">Retour</button>
@@ -93,28 +99,35 @@
 
         <div id="receive-screen" class="screen">
             <div class="header">
-                <h2>Recevoir un fichier</h2>
+                <h2>Recevoir</h2>
             </div>
 
             <div class="code-input-section">
-                <h3>Entrez le code de partage</h3>
-                <input type="text" id="room-code-input" class="code-input" placeholder="Collez le code reçu">
-                <button class="btn btn-primary" onclick="joinRoom()">
+                <input type="text" 
+                       id="room-code-input" 
+                       class="code-input" 
+                       placeholder="000-000" 
+                       autocomplete="off" 
+                       autocorrect="off" 
+                       autocapitalize="off" 
+                       spellcheck="false">
+                
+                <button class="btn btn-primary" onclick="joinRoom()" style="width: 100%;">
                     <span class="btn-icon">🔗</span>
-                    <span class="btn-text">Se connecter</span>
+                    <span class="btn-text">Rejoindre</span>
                 </button>
             </div>
 
             <div id="receive-progress" style="display: none;">
-                <div id="receive-file-info" class="file-info"></div>
-                <h3 style="text-align: center; margin-bottom: 24px; color: var(--text-dark);">Réception en cours</h3>
+                <div id="receive-file-info" class="file-info" style="margin-bottom: 20px;"></div>
+                
                 <div class="progress-container">
                     <div class="progress-bar">
                         <div id="receive-progress-fill" class="progress-fill"></div>
                     </div>
                     <span id="receive-progress-text" class="progress-text">0%</span>
                 </div>
-                <p class="status-message">📦 Déchiffrement et téléchargement...</p>
+                <p class="status-message"><small>Déchiffrement en cours...</small></p>
             </div>
 
             <button class="btn btn-back" onclick="showHomeScreen()">Retour</button>
@@ -122,17 +135,20 @@
 
         <div id="complete-screen" class="screen">
             <div class="header">
-                <h2>Transfert réussi</h2>
+                <h2>Terminé</h2>
             </div>
 
             <div class="success-message">
-                <div class="success-icon">✓</div>
-                <p>Votre fichier a été transféré avec succès en toute sécurité et confidentialité.</p>
+                <div class="success-icon">
+                    <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="20 6 9 17 4 12"></polyline>
+                    </svg>
+                </div>
+                <p>Le transfert est terminé.<br>Le fichier a été sécurisé.</p>
             </div>
 
-            <button class="btn btn-primary" onclick="showHomeScreen()">
-                <span class="btn-icon">🏠</span>
-                <span class="btn-text">Accueil</span>
+            <button class="btn btn-secondary" onclick="showHomeScreen()">
+                <span class="btn-text">Retour à l'accueil</span>
             </button>
         </div>
     </div>
@@ -140,5 +156,38 @@
     <script src="{{ url_for('static', filename='js/tweetnacl.min.js') }}"></script>
     <script src="{{ url_for('static', filename='js/socket.io.min.js') }}"></script>
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+    
+    <script>
+        // Surcharge ou ajout de la fonction showToast pour matcher la structure CSS
+        window.originalShowToast = window.showToast || function(){};
+        
+        window.showToast = function(message, type = 'info') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            
+            // Icônes basées sur le type
+            let icon = 'ℹ️';
+            if (type === 'success') icon = '✓'; // ou SVG
+            if (type === 'error') icon = '✕';
+            
+            // Structure HTML attendue par le CSS "Apple"
+            toast.innerHTML = `
+                <span class="toast-icon" style="font-weight:bold;">${icon}</span>
+                <div class="toast-content">
+                    <div class="toast-title">${message}</div>
+                </div>
+            `;
+            
+            container.appendChild(toast);
+            
+            // Animation de sortie
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transform = 'translateY(-20px) scale(0.95)';
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        };
+    </script>
 </body>
 </html>
